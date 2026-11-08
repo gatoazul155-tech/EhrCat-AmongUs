@@ -1,0 +1,198 @@
+﻿using System;
+using System.Collections;
+using System.Diagnostics.CodeAnalysis;
+using System.Text;
+using System.Text.RegularExpressions;
+using HarmonyLib;
+using InnerNet;
+using UnityEngine;
+using UnityEngine.Networking;
+
+#if IL2CPP
+using System.Text.Json;
+#else
+using Newtonsoft.Json.Linq;
+#endif
+
+namespace EHR.Modules;
+
+public static class LobbySharingAPI
+{
+    private const float BufferTime = 5;
+    public static long LastRequestTimeStamp;
+    public static string LastRoomCode = string.Empty;
+    private static string Token = string.Empty;
+
+    private static void NotifyLobbyCreated()
+    {
+        int gameId = AmongUsClient.Instance.GameId;
+        if (gameId == 32) return;
+
+        string roomCode = GameCode.IntToGameName(gameId);
+        if (roomCode == LastRoomCode || string.IsNullOrWhiteSpace(roomCode)) return;
+        LastRoomCode = roomCode;
+
+        int modLanguage = Options.ModLanguage.GetValue();
+        string language = modLanguage == 0 ? Translator.GetUserTrueLang().ToString() : ((Options.ModLanguages)modLanguage).ToString();
+
+        string serverName = Utils.GetRegionName();
+        string hostName = Main.AllPlayerNames[PlayerControl.LocalPlayer.PlayerId].RemoveHtmlTags();
+        string map = Options.RandomMapsMode.GetBool() ? "Random" : SubmergedCompatibility.Loaded && Main.NormalOptions.MapId == 6 ? "Submerged" : Main.CurrentMap.ToString();
+        string gameMode = Options.EnableAutoGMRotation.GetBool() ? "Rotating" : Options.CurrentGameMode.ToString();
+        int maxPlayers = Main.NormalOptions.MaxPlayers;
+        const string version = $"{Main.ModName} v{Main.PluginVersion}";
+        Main.Instance.StartCoroutine(SendLobbyCreatedRequest(roomCode, serverName, language, version, gameId, hostName, map, gameMode, maxPlayers));
+    }
+
+    private static IEnumerator SendLobbyCreatedRequest(string roomCode, string serverName, string language, string version, int gameId, string hostName, string map, string gameMode, int maxPlayers)
+    {
+        long timeSinceLastRequest = Utils.TimeStamp - LastRequestTimeStamp;
+        if (timeSinceLastRequest < BufferTime) yield return new WaitForSecondsRealtime(BufferTime);
+        LastRequestTimeStamp = Utils.TimeStamp;
+
+        var jsonData = $"{{\"roomCode\":\"{roomCode}\",\"serverName\":\"{serverName}\",\"language\":\"{language}\",\"version\":\"{version}\",\"gameId\":\"{gameId}\",\"hostName\":\"{hostName}\",\"map\":\"{map}\",\"gameMode\":\"{gameMode}\",\"maxPlayers\":\"{maxPlayers}\"}}";
+        byte[] jsonToSend = new UTF8Encoding().GetBytes(jsonData);
+
+        var request = new UnityWebRequest("https://app.gurge44.eu/lobby_created", "POST")
+        {
+            uploadHandler = new UploadHandlerRaw(jsonToSend),
+            downloadHandler = new DownloadHandlerBuffer()
+        };
+
+        request.SetRequestHeader("Content-Type", "application/json");
+        request.SetRequestHeader("User-Agent", $"{version} - {Regex.Replace(hostName, @"[^\x20-\x7E]", "")}");
+        request.SetRequestHeader("Authorization", "Bearer " + EOSManager.Instance.UserIDToken);
+        yield return request.SendWebRequest();
+
+        LastRequestTimeStamp = Utils.TimeStamp;
+        bool success = request.result == UnityWebRequest.Result.Success;
+        Logger.Msg(success ? "Lobby created notification sent successfully." : $"Failed to send lobby created notification: {request.error}", "LobbyNotifierForDiscord.SendLobbyCreatedRequest");
+
+        if (success)
+        {
+            try
+            {
+                string responseText = request.downloadHandler.text;
+                Logger.Msg("Response from server: " + responseText, "LobbyNotifierForDiscord.SendLobbyCreatedRequest");
+
+#if IL2CPP
+                using JsonDocument doc = JsonDocument.Parse(responseText);
+                Token = doc.RootElement.GetProperty("token").GetString();
+#else
+                JObject doc = JObject.Parse(responseText);
+                Token = doc["token"]?.ToString();
+#endif
+
+                Logger.Msg($"Token for room {roomCode}: {Token}", "LobbyNotifierForDiscord.SendLobbyCreatedRequest");
+            }
+            catch (Exception ex) { Logger.Msg($"Failed to parse token from response: {ex.Message}", "LobbyNotifierForDiscord.SendLobbyCreatedRequest"); }
+
+            Utils.SendMessage("\n", PlayerControl.LocalPlayer.PlayerId, Translator.GetString("Message.LobbyCodeSent"));
+        }
+        else Utils.SendMessage("\n", PlayerControl.LocalPlayer.PlayerId, string.Format(Translator.GetString("Message.LobbyCodeSendError"), request.error));
+    }
+
+    public static void NotifyLobbyStatusChanged(LobbyStatus status)
+    {
+        if (!Options.PostLobbyCodeToEHRWebsite.GetBool() || !AmongUsClient.Instance.AmHost) return;
+
+        if (status == LobbyStatus.Closed)
+        {
+            LastRoomCode = string.Empty;
+        }
+        else if (GameCode.IntToGameName(AmongUsClient.Instance.GameId) != LastRoomCode)
+        {
+            status = LobbyStatus.Closed;
+            StartMessageEdit();
+            LateTask.New(NotifyLobbyCreated, BufferTime * 2);
+            return;
+        }
+
+        StartMessageEdit();
+        return;
+
+        void StartMessageEdit()
+        {
+            string map = Options.RandomMapsMode.GetBool() ? "Random" : SubmergedCompatibility.Loaded && Main.NormalOptions.MapId == 6 ? "Submerged" : Main.CurrentMap.ToString();
+            string gameMode = Options.EnableAutoGMRotation.GetBool() ? "Rotating" : Options.CurrentGameMode.ToString();
+            int playerCount = PlayerControl.AllPlayerControls.Count;
+            int maxPlayers = Main.NormalOptions.MaxPlayers;
+            Main.Instance.StartCoroutine(SendLobbyStatusChangedRequest(LastRoomCode, status.ToString().Replace('_', ' '), playerCount, maxPlayers, map, gameMode));
+        }
+    }
+
+    private static IEnumerator SendLobbyStatusChangedRequest(string roomCode, string newStatus, int playerCount, int maxPlayers, string map, string gameMode)
+    {
+        if (string.IsNullOrWhiteSpace(Token)) yield break;
+
+        long timeSinceLastRequest = Utils.TimeStamp - LastRequestTimeStamp;
+        if (timeSinceLastRequest < BufferTime) yield return new WaitForSecondsRealtime(BufferTime);
+        LastRequestTimeStamp = Utils.TimeStamp;
+
+        var jsonData = $"{{\"roomCode\":\"{roomCode}\",\"token\":\"{Token}\",\"newStatus\":\"{newStatus}\",\"playerCount\":\"{playerCount}\",\"maxPlayers\":\"{maxPlayers}\",\"map\":\"{map}\",\"gameMode\":\"{gameMode}\"}}";
+        byte[] jsonToSend = new UTF8Encoding().GetBytes(jsonData);
+
+        var request = new UnityWebRequest("https://app.gurge44.eu/update_status", "POST")
+        {
+            uploadHandler = new UploadHandlerRaw(jsonToSend),
+            downloadHandler = new DownloadHandlerBuffer()
+        };
+
+        request.SetRequestHeader("Content-Type", "application/json");
+        request.SetRequestHeader("User-Agent", $"{Main.ModName} v{Main.PluginVersion}");
+        yield return request.SendWebRequest();
+
+        LastRequestTimeStamp = Utils.TimeStamp;
+        bool success = request.result == UnityWebRequest.Result.Success;
+        Logger.Msg(success ? "Lobby status changed notification sent successfully." : $"Failed to send lobby status changed notification: {request.error}", "LobbyNotifierForDiscord.SendLobbyStatusChangedRequest");
+
+        if (!success && request.responseCode == 404)
+        {
+            LastRoomCode = string.Empty;
+            LateTask.New(NotifyLobbyCreated, BufferTime);
+            Logger.Msg("Room code not found, re-sending lobby created notification.", "LobbyNotifierForDiscord.SendLobbyStatusChangedRequest");
+        }
+    }
+}
+
+[SuppressMessage("ReSharper", "InconsistentNaming")]
+public enum LobbyStatus
+{
+    In_Lobby,
+    In_Game,
+    Ended,
+    Closed
+}
+
+[HarmonyPatch(typeof(InnerNetClient), nameof(InnerNetClient.DisconnectInternal))]
+internal static class ExitGamePatch
+{
+    public static void Prefix(InnerNetClient __instance, DisconnectReasons reason)
+    {
+        if (__instance is not AmongUsClient) return;
+
+        Logger.Msg($"Exiting game - reason: {reason}", "ExitGamePatch.Prefix");
+
+        GameStates.InGame = false;
+        GameEndChecker.LoadingEndScreen = false;
+        DataFlagRateLimiter.DropQueue();
+
+        if (SetUpRoleTextPatch.IsInIntro)
+        {
+            SetUpRoleTextPatch.IsInIntro = false;
+            Utils.NotifyRoles(ForceLoop: true);
+        }
+
+        if (GameSettingMenu.Instance)
+            GameSettingMenuPatch.Close_Prefix();
+    }
+
+    public static void Postfix(InnerNetClient __instance)
+    {
+        if (__instance is not AmongUsClient) return;
+
+        LobbySharingAPI.NotifyLobbyStatusChanged(LobbyStatus.Closed);
+
+        GameEndChecker.LoadingEndScreen = false;
+    }
+}
